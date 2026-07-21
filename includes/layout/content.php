@@ -236,6 +236,18 @@ if (!isset($url) || $url === 'dashboard') {
         case 'Performance Management':
             $file = 'pm/page';
             break;
+        case 'Create IPCRF':
+            $file = 'pm/create-ipcrf';
+            break;
+        case 'IPCRF Details':
+            $file = 'pm/ipcrf-details';
+            break;
+        case 'Add Objective':
+            $file = 'pm/add-objective';
+            break;
+        case 'Review IPCRF':
+            $file = 'pm/review-ipcrf';
+            break;
         case 'Daily Time Record':
             $file = 'dtr/page';
         case 'System Overview':

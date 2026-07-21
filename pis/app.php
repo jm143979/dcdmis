@@ -279,3 +279,334 @@ if (isset($_POST['cancel-transfer-request'])) {
         $message = $e->getMessage();
     }
 }
+
+// ========== PERFORMANCE MANAGEMENT ==========
+
+if (isset($_POST['create-ipcrf'])) {
+    $employeeId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $cycleId = (int) sanitize(decipher($_POST['cycle-verifier'] ?? null));
+    $validatorId = !empty($_POST['validator_id']) ? (int) sanitize($_POST['validator_id']) : null;
+    $kraTitles = $_POST['kra_title'] ?? [];
+    $kraWeights = $_POST['kra_weight'] ?? [];
+    $showAlert = true;
+    $success = false;
+
+    try {
+        if (empty($employeeId) || empty($cycleId)) {
+            throw new Exception('Invalid request parameters.');
+        }
+
+        if (empty($kraTitles) || empty($kraWeights)) {
+            throw new Exception('Please define at least one Key Result Area.');
+        }
+
+        $totalWeight = array_sum(array_map('intval', $kraWeights));
+        if ($totalWeight !== 100) {
+            throw new Exception("KRA weights must total 100%. Current total: {$totalWeight}%.");
+        }
+
+        if (pmIpcrfByEmployee($employeeId, $cycleId)) {
+            throw new Exception('You already have an IPCRF for this cycle.');
+        }
+
+        beginTransaction();
+
+        $ipcrfId = createPmIpcrf($cycleId, $employeeId, $validatorId);
+        if (!$ipcrfId) {
+            throw new Exception('Failed to create IPCRF record.');
+        }
+
+        foreach ($kraTitles as $i => $title) {
+            $title = sanitize($title);
+            $weight = (int) sanitize($kraWeights[$i]);
+            if (empty($title) || $weight <= 0) continue;
+
+            $result = createPmKra($ipcrfId, $title, $weight, $i + 1);
+            if (!$result) {
+                throw new Exception('Failed to create KRA: ' . $title);
+            }
+        }
+
+        commit();
+
+        $success = true;
+        $message = 'IPCRF has been created successfully. You can now add objectives to each KRA.';
+        createSystemLog($stationId, $userId, 'Created IPCRF', $employeeId, clientIp());
+
+        redirect(customUri('pis', 'IPCRF Details', $ipcrfId));
+
+    } catch (Exception $e) {
+        rollBack();
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['save-objective'])) {
+    $kraId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $ipcrfId = (int) sanitize(decipher($_POST['ipcrf-verifier'] ?? null));
+    $objective = sanitize($_POST['objective'] ?? '');
+    $indicator = sanitize($_POST['performance_indicator'] ?? '');
+    $target = sanitize($_POST['target'] ?? '');
+    $weight = (int) sanitize($_POST['weight'] ?? 0);
+    $timeline = sanitize($_POST['timeline'] ?? '');
+    $showAlert = true;
+    $success = false;
+
+    try {
+        if (empty($kraId) || empty($ipcrfId) || empty($objective)) {
+            throw new Exception('Objective is required.');
+        }
+
+        if ($weight <= 0 || $weight > 100) {
+            throw new Exception('Weight must be between 1 and 100.');
+        }
+
+        if (empty($indicator)) {
+            throw new Exception('Performance Indicator is required.');
+        }
+
+        if (empty($timeline)) {
+            throw new Exception('Timeline is required.');
+        }
+
+        $kra = pmKra($kraId);
+        $ipcrf = pmIpcrf($ipcrfId);
+
+        if (!$kra || !$ipcrf || (int) $ipcrf['employee_id'] !== $userId) {
+            throw new Exception('Invalid request.');
+        }
+
+        if ($ipcrf['status'] !== 'Draft' && $ipcrf['status'] !== 'Returned') {
+            throw new Exception('Cannot add objectives to a submitted IPCRF.');
+        }
+
+        $existingCount = count(pmObjectives($kraId));
+        $result = createPmObjective($kraId, $ipcrfId, $objective, $indicator, $target, $weight, $timeline, $existingCount + 1);
+
+        if (!$result) {
+            throw new Exception('Failed to save objective.');
+        }
+
+        $success = true;
+        $message = 'Objective has been added successfully.';
+        createSystemLog($stationId, $userId, 'Added IPCRF objective', $userId, clientIp());
+
+    } catch (Exception $e) {
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['delete-objective'])) {
+    $kraId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $objectiveId = (int) sanitize(decipher($_POST['objective-verifier'] ?? null));
+    $showAlert = true;
+    $success = false;
+
+    try {
+        if (empty($kraId) || empty($objectiveId)) {
+            throw new Exception('Invalid request.');
+        }
+
+        $obj = pmObjective($objectiveId);
+        if (!$obj || (int) $obj['kra_id'] !== $kraId) {
+            throw new Exception('Objective not found.');
+        }
+
+        $ipcrf = pmIpcrf($obj['ipcrf_id']);
+        if (!$ipcrf || (int) $ipcrf['employee_id'] !== $userId) {
+            throw new Exception('Unauthorized.');
+        }
+
+        if ($ipcrf['status'] !== 'Draft' && $ipcrf['status'] !== 'Returned') {
+            throw new Exception('Cannot delete objectives from a submitted IPCRF.');
+        }
+
+        $result = deletePmObjective($objectiveId);
+        if (!$result) {
+            throw new Exception('Failed to delete objective.');
+        }
+
+        $success = true;
+        $message = 'Objective has been deleted.';
+        createSystemLog($stationId, $userId, 'Deleted IPCRF objective', $userId, clientIp());
+
+    } catch (Exception $e) {
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['submit-ipcrf'])) {
+    $ipcrfId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $remarks = sanitize($_POST['ratee_remarks'] ?? '');
+    $showAlert = true;
+    $success = false;
+
+    try {
+        $ipcrf = pmIpcrf($ipcrfId);
+        if (!$ipcrf || (int) $ipcrf['employee_id'] !== $userId) {
+            throw new Exception('Invalid request.');
+        }
+
+        if ($ipcrf['status'] !== 'Draft' && $ipcrf['status'] !== 'Returned') {
+            throw new Exception('This IPCRF cannot be submitted.');
+        }
+
+        $kras = pmKras($ipcrfId);
+        if (empty($kras)) {
+            throw new Exception('Cannot submit an IPCRF without KRAs.');
+        }
+
+        $hasObjectives = false;
+        foreach ($kras as $kra) {
+            if (!empty(pmObjectives($kra['id']))) {
+                $hasObjectives = true;
+                break;
+            }
+        }
+
+        if (!$hasObjectives) {
+            throw new Exception('Cannot submit an IPCRF without objectives. Add at least one objective.');
+        }
+
+        $result = updatePmIpcrfStatus($ipcrfId, 'Submitted', $remarks, 'ratee_remarks');
+        if ($result === false) {
+            throw new Exception('Failed to submit IPCRF.');
+        }
+
+        $success = true;
+        $message = 'IPCRF has been submitted for validation.';
+        createSystemLog($stationId, $userId, 'Submitted IPCRF for validation', $userId, clientIp());
+
+    } catch (Exception $e) {
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['save-ratings'])) {
+    $ipcrfId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $validatorRemarks = sanitize($_POST['validator_remarks'] ?? '');
+    $objIds = $_POST['obj_id'] ?? [];
+    $ratingsQ = $_POST['rating_q'] ?? [];
+    $ratingsE = $_POST['rating_e'] ?? [];
+    $ratingsT = $_POST['rating_t'] ?? [];
+    $objRemarks = $_POST['obj_remarks'] ?? [];
+    $showAlert = true;
+    $success = false;
+
+    try {
+        $ipcrf = pmIpcrf($ipcrfId);
+        if (!$ipcrf || (int) $ipcrf['validator_id'] !== $userId) {
+            throw new Exception('Unauthorized.');
+        }
+
+        beginTransaction();
+
+        foreach ($objIds as $i => $encId) {
+            $objId = (int) sanitize(decipher($encId));
+            $q = !empty($ratingsQ[$i]) ? (float) $ratingsQ[$i] : null;
+            $e2 = !empty($ratingsE[$i]) ? (float) $ratingsE[$i] : null;
+            $t = !empty($ratingsT[$i]) ? (float) $ratingsT[$i] : null;
+            $rem = sanitize($objRemarks[$i] ?? '');
+
+            if ($q !== null && $e2 !== null && $t !== null) {
+                updatePmObjectiveRating($objId, $q, $e2, $t, $rem);
+            }
+        }
+
+        if (!empty($validatorRemarks)) {
+            update('pm_ipcrf', ['validator_remarks' => $validatorRemarks], '`id` = ?', [$ipcrfId]);
+        }
+
+        commit();
+
+        $success = true;
+        $message = 'Ratings have been saved successfully.';
+        createSystemLog($stationId, $userId, 'Saved IPCRF ratings', $ipcrf['employee_id'], clientIp());
+
+    } catch (Exception $e) {
+        rollBack();
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['validate-ipcrf'])) {
+    $ipcrfId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $validatorRemarks = sanitize($_POST['validator_remarks'] ?? '');
+    $objIds = $_POST['obj_id'] ?? [];
+    $ratingsQ = $_POST['rating_q'] ?? [];
+    $ratingsE = $_POST['rating_e'] ?? [];
+    $ratingsT = $_POST['rating_t'] ?? [];
+    $objRemarks = $_POST['obj_remarks'] ?? [];
+    $showAlert = true;
+    $success = false;
+
+    try {
+        $ipcrf = pmIpcrf($ipcrfId);
+        if (!$ipcrf || (int) $ipcrf['validator_id'] !== $userId) {
+            throw new Exception('Unauthorized.');
+        }
+
+        if ($ipcrf['status'] !== 'Submitted' && $ipcrf['status'] !== 'Validated') {
+            throw new Exception('This IPCRF cannot be validated.');
+        }
+
+        beginTransaction();
+
+        foreach ($objIds as $i => $encId) {
+            $objId = (int) sanitize(decipher($encId));
+            $q = !empty($ratingsQ[$i]) ? (float) $ratingsQ[$i] : null;
+            $e2 = !empty($ratingsE[$i]) ? (float) $ratingsE[$i] : null;
+            $t = !empty($ratingsT[$i]) ? (float) $ratingsT[$i] : null;
+            $rem = sanitize($objRemarks[$i] ?? '');
+
+            if ($q === null || $e2 === null || $t === null) {
+                throw new Exception('All objectives must be rated (Q, E, T) before validation.');
+            }
+
+            updatePmObjectiveRating($objId, $q, $e2, $t, $rem);
+        }
+
+        $finalRating = pmComputeFinalRating($ipcrfId);
+        $adjectival = pmAdjectivalRating($finalRating);
+
+        updatePmIpcrfFinalRating($ipcrfId, $finalRating, $adjectival);
+        updatePmIpcrfStatus($ipcrfId, 'Validated', $validatorRemarks, 'validator_remarks');
+        updatePmIpcrfPhase($ipcrfId, 3);
+
+        commit();
+
+        $success = true;
+        $message = "IPCRF has been validated. Final Rating: {$finalRating} ({$adjectival}).";
+        createSystemLog($stationId, $userId, 'Validated IPCRF', $ipcrf['employee_id'], clientIp());
+
+    } catch (Exception $e) {
+        rollBack();
+        $message = $e->getMessage();
+    }
+}
+
+if (isset($_POST['return-ipcrf'])) {
+    $ipcrfId = (int) sanitize(decipher($_POST['verifier'] ?? null));
+    $validatorRemarks = sanitize($_POST['validator_remarks'] ?? '');
+    $showAlert = true;
+    $success = false;
+
+    try {
+        $ipcrf = pmIpcrf($ipcrfId);
+        if (!$ipcrf || (int) $ipcrf['validator_id'] !== $userId) {
+            throw new Exception('Unauthorized.');
+        }
+
+        $result = updatePmIpcrfStatus($ipcrfId, 'Returned', $validatorRemarks, 'validator_remarks');
+        if ($result === false) {
+            throw new Exception('Failed to return IPCRF.');
+        }
+
+        $success = true;
+        $message = 'IPCRF has been returned to the ratee for revision.';
+        createSystemLog($stationId, $userId, 'Returned IPCRF to ratee', $ipcrf['employee_id'], clientIp());
+
+    } catch (Exception $e) {
+        $message = $e->getMessage();
+    }
+}
